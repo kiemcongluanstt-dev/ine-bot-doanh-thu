@@ -1,15 +1,14 @@
 """
-SERVER CHẠY TRÊN CLOUD (deploy lên Render.com)
-================================================
-- Nhận webhook từ LINE, khi có ai gõ "DT <mã siêu thị>" trong group -> trả lời
-  báo cáo doanh thu MỚI NHẤT đã được máy tính đẩy lên (qua endpoint /update).
-- KHÔNG tự đọc file Excel (server ở xa, không có file đó) - chỉ lưu lại số liệu
-  mà máy tính gửi lên qua push_report.py.
+SERVER CHẠY TRÊN CLOUD (deploy lên Render.com) - PHIÊN BẢN 2
+================================================================
+- Lệnh "DT <mã siêu thị>"  -> trả lời báo cáo DOANH THU TOÀN SIÊU THỊ
+- Lệnh "NAM <mã siêu thị>" -> trả lời báo cáo DOANH THU NGÀNH HÀNG NẤM
+- Không tự đọc file Excel (server ở xa) - chỉ lưu số liệu máy tính đẩy lên qua /update.
 
-BIẾN MÔI TRƯỜNG CẦN SET TRÊN RENDER (mục Environment):
+BIẾN MÔI TRƯỜNG CẦN SET TRÊN RENDER (giữ nguyên như cũ, không đổi):
     LINE_CHANNEL_ACCESS_TOKEN
     LINE_CHANNEL_SECRET
-    PUSH_SECRET          (tự đặt 1 chuỗi bí mật bất kỳ, dùng để máy tính xác thực khi đẩy dữ liệu lên)
+    PUSH_SECRET
 """
 
 import base64
@@ -28,8 +27,6 @@ LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
 app = Flask(__name__)
 
-# Lưu báo cáo mới nhất theo mã siêu thị, trong bộ nhớ (mất khi server khởi động lại -
-# vì vậy mỗi khi server restart, cần đẩy lại dữ liệu 1 lần từ máy tính).
 latest_reports = {}
 
 
@@ -60,6 +57,17 @@ def reply_flex(reply_token: str, bubble: dict, alt_text: str):
     _reply(reply_token, [{"type": "flex", "altText": alt_text, "contents": bubble}])
 
 
+def _lookup_and_reply(reply_token: str, key: str, not_found_label: str):
+    report = latest_reports.get(key)
+    if report:
+        reply_flex(reply_token, report["bubble"], report["alt_text"])
+    else:
+        reply_text(
+            reply_token,
+            f"Chưa có dữ liệu {not_found_label}. Hãy đợi máy tính đẩy dữ liệu lên.",
+        )
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature", "")
@@ -80,17 +88,12 @@ def webhook():
         text = message.get("text", "").strip().upper()
         reply_token = event.get("replyToken")
 
-        if text.startswith("DT "):
+        if text.startswith("NAM "):
+            store_code = text[4:].strip()
+            _lookup_and_reply(reply_token, f"NAM_{store_code}", f"ngành hàng Nấm cho mã {store_code}")
+        elif text.startswith("DT "):
             store_code = text[3:].strip()
-            report = latest_reports.get(store_code)
-            if report:
-                reply_flex(reply_token, report["bubble"], report["alt_text"])
-            else:
-                reply_text(
-                    reply_token,
-                    f"Chưa có dữ liệu doanh thu cho mã {store_code}. "
-                    f"Hãy đợi máy tính đẩy dữ liệu lên (chạy push_report.py).",
-                )
+            _lookup_and_reply(reply_token, store_code, f"doanh thu cho mã {store_code}")
 
     return "OK"
 
@@ -104,15 +107,17 @@ def update():
 
     data = request.get_json(force=True)
     store_code = str(data.get("store_code", "")).strip()
+    category = str(data.get("category", "")).strip().upper()
     if not store_code:
         return {"status": "error", "message": "thieu store_code"}, 400
 
-    latest_reports[store_code] = {
+    key = f"{category}_{store_code}" if category else store_code
+    latest_reports[key] = {
         "bubble": data["bubble"],
         "alt_text": data["alt_text"],
     }
-    print(f"Da nhan du lieu moi cho ma sieu thi {store_code}")
-    return {"status": "ok", "store_code": store_code}
+    print(f"Da nhan du lieu moi cho key {key}")
+    return {"status": "ok", "key": key}
 
 
 @app.route("/", methods=["GET"])
