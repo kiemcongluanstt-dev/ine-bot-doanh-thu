@@ -87,6 +87,8 @@ def webhook():
 
         text = message.get("text", "").strip().upper()
         reply_token = event.get("replyToken")
+        source = event.get("source", {})
+        print(f"[TIN NHAN] '{text}' tu source: {source}")
 
         if text.startswith("NAM "):
             store_code = text[4:].strip()
