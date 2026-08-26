@@ -99,10 +99,10 @@ def webhook():
         date_label = f" ngày {tokens[2]}" if len(tokens) >= 3 else ""
 
         cmd_map = {
-            "DT": (None, "doanh thu"),
-            "NAM": ("NAM", "ngành hàng Nấm"),
-            "FRESH": ("FRESH", "ngành hàng Fresh"),
-            "FRESHCT": ("FRESHCT", "chi tiết Nhập/Bán Fresh"),
+            "DTST": (None, "doanh thu"),
+            "NAMST": ("NAM", "ngành hàng Nấm"),
+            "FRESHST": ("FRESH", "ngành hàng Fresh"),
+            "MMKKST": ("FRESHCT", "chi tiết Nhập/Bán Fresh"),
         }
         if cmd not in cmd_map:
             continue
