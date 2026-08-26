@@ -23,6 +23,7 @@ import requests
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 PUSH_SECRET = os.environ.get("PUSH_SECRET", "")
+DEFAULT_STORE_CODE = "14978"  # mã siêu thị mặc định khi người dùng chỉ gõ tên lệnh, không kèm mã
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 
 app = Flask(__name__)
@@ -91,12 +92,9 @@ def webhook():
         print(f"[TIN NHAN] '{text}' tu source: {source}")
 
         tokens = text.split()
-        if len(tokens) < 2:
+        if len(tokens) < 1:
             continue
         cmd = tokens[0]
-        store_code = tokens[1]
-        date_str = normalize_date(tokens[2]) if len(tokens) >= 3 else None
-        date_label = f" ngày {tokens[2]}" if len(tokens) >= 3 else ""
 
         cmd_map = {
             "DTST": (None, "doanh thu"),
@@ -106,6 +104,11 @@ def webhook():
         }
         if cmd not in cmd_map:
             continue
+
+        store_code = DEFAULT_STORE_CODE
+        date_token = tokens[1] if len(tokens) >= 2 else None
+        date_str = normalize_date(date_token) if date_token else None
+        date_label = f" ngày {date_token}" if date_str else ""
 
         category, label = cmd_map[cmd]
         key = f"{category}_{store_code}" if category else store_code
