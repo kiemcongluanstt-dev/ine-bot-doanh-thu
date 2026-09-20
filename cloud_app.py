@@ -101,13 +101,14 @@ def webhook():
             "NAMST": ("NAM", "ngành hàng Nấm"),
             "FRESHST": ("FRESH", "ngành hàng Fresh"),
             "MMKKST": ("FRESHCT", "chi tiết Nhập/Bán Fresh"),
+            "NXST": ("NX_SUMMARY", "tổng quan Nhập/Xuất"),
         }
         if cmd not in cmd_map:
             continue
 
         store_code = DEFAULT_STORE_CODE
 
-        # Loai bo tu de "NGAY", tim token dang ngay/thang, phan con lai la ten nganh hang (chi ap dung cho MMKKST)
+        # Loai bo tu de "NGAY", tim token dang ngay/thang, phan con lai la ten nganh hang (ap dung cho MMKKST/NXST)
         rest = [t for t in tokens[1:] if t not in ("NGÀY", "NGAY")]
         date_token = None
         remaining = []
@@ -129,6 +130,13 @@ def webhook():
                 key = f"FRESHCT_{cat_slug}_{store_code}"
                 label = f"chi tiết {cat_text.title()} (Fresh)"
 
+        if cmd == "NXST" and remaining:
+            cat_text = " ".join(remaining)
+            cat_slug = NX_CATEGORY_ALIASES.get(cat_text)
+            if cat_slug:
+                key = f"NX_{cat_slug}_{store_code}"
+                label = f"Nhập/Xuất {cat_text.title()}"
+
         if date_str:
             key = f"{key}_{date_str}"
 
@@ -149,6 +157,27 @@ FRESH_CATEGORY_ALIASES = {
     "THUY HAI SAN": "THUYHAISAN",
     "HẢI SẢN": "THUYHAISAN",
     "HAI SAN": "THUYHAISAN",
+}
+
+NX_CATEGORY_ALIASES = {
+    "RAU ĐÀ LẠT": "RAUDALAT",
+    "RAU DA LAT": "RAUDALAT",
+    "RAU ĐỊA PHƯƠNG": "RAUDIAPHUONG",
+    "RAU DIA PHUONG": "RAUDIAPHUONG",
+    "THỊT ĐỊA PHƯƠNG": "THITDIAPHUONG",
+    "THIT DIA PHUONG": "THITDIAPHUONG",
+    "THỊT NHẬP KHẨU": "THITNHAPKHAU",
+    "THIT NHAP KHAU": "THITNHAPKHAU",
+    "TRÁI CÂY NHẬP KHẨU": "TRAICAYNHAPKHAU",
+    "TRAI CAY NHAP KHAU": "TRAICAYNHAPKHAU",
+    "TRÁI CÂY TẬP TRUNG": "TRAICAYTAPTRUNG",
+    "TRAI CAY TAP TRUNG": "TRAICAYTAPTRUNG",
+    "THỦY HẢI SẢN TẬP TRUNG": "THUYSANTAPTRUNG",
+    "THUY HAI SAN TAP TRUNG": "THUYSANTAPTRUNG",
+    "THỦY HẢI SẢN NHẬP KHẨU": "THUYSANNHAPKHAU",
+    "THUY HAI SAN NHAP KHAU": "THUYSANNHAPKHAU",
+    "TRỨNG": "TRUNG",
+    "TRUNG": "TRUNG",
 }
 
 
