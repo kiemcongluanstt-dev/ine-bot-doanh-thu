@@ -1,15 +1,20 @@
 """
-SERVER CHẠY TRÊN CLOUD (deploy lên Render.com)
-================================================
-- Nhận webhook từ LINE, khi có ai gõ "DT <mã siêu thị>" trong group -> trả lời
-  báo cáo doanh thu MỚI NHẤT đã được máy tính đẩy lên (qua endpoint /update).
-- KHÔNG tự đọc file Excel (server ở xa, không có file đó) - chỉ lưu lại số liệu
-  mà máy tính gửi lên qua push_report.py.
+BOT LINE TRẢ LỜI DOANH THU — chạy trên Render (gunicorn cloud_app:app)
+=====================================================================
+Chức năng:
+  1) POST /update    : máy tính ở cửa hàng đẩy báo cáo lên (push_report.py / watch_and_push.py).
+                       Bắt buộc có header  X-Push-Secret  khớp biến môi trường PUSH_SECRET.
+  2) POST /callback  : LINE gọi vào khi có tin nhắn trong group/chat (webhook).
+                       Gõ  "DT 30400"  -> bot trả thẻ báo cáo của siêu thị mã 30400.
+                       Gõ  "DT"  hoặc  "DTST"  -> bot trả thẻ của tất cả siêu thị đang có.
+  3) GET  /          : kiểm tra bot còn sống (health check).
 
-BIẾN MÔI TRƯỜNG CẦN SET TRÊN RENDER (mục Environment):
-    LINE_CHANNEL_ACCESS_TOKEN
-    LINE_CHANNEL_SECRET
-    PUSH_SECRET          (tự đặt 1 chuỗi bí mật bất kỳ, dùng để máy tính xác thực khi đẩy dữ liệu lên)
+Biến môi trường cần đặt trên Render (mục Environment):
+  LINE_CHANNEL_ACCESS_TOKEN   (bắt buộc)  token của kênh Messaging API
+  PUSH_SECRET                 (bắt buộc)  chuỗi bí mật, phải giống PUSH_SECRET ở máy tính
+  LINE_CHANNEL_SECRET         (khuyến nghị) để xác thực tin nhắn thật sự do LINE gửi
+
+Start Command trên Render:  gunicorn cloud_app:app
 """
 
 import base64
@@ -17,109 +22,150 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import tempfile
+import threading
+import time
 
-from flask import Flask, request, abort
 import requests
-
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-PUSH_SECRET = os.environ.get("PUSH_SECRET", "")
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+from flask import Flask, abort, jsonify, request
 
 app = Flask(__name__)
 
-# Lưu báo cáo mới nhất theo mã siêu thị, trong bộ nhớ (mất khi server khởi động lại -
-# vì vậy mỗi khi server restart, cần đẩy lại dữ liệu 1 lần từ máy tính).
-latest_reports = {}
+LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+STORE_FILE = os.path.join(tempfile.gettempdir(), "dt_reports.json")
+_lock = threading.Lock()
+
+# "DT 30400", "dt30400", "DT" (một mình), "DTST"
+CMD_RE = re.compile(r"^\s*(?:DT|DTST)\s*(\d+)?\s*$", re.IGNORECASE)
 
 
-def verify_signature(body: bytes, signature: str) -> bool:
-    if not LINE_CHANNEL_SECRET:
-        return False
-    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
-    expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
+def env(name: str) -> str:
+    return os.environ.get(name, "").strip()
 
 
-def _reply(reply_token: str, messages: list):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-    }
-    payload = {"replyToken": reply_token, "messages": messages}
-    resp = requests.post(LINE_REPLY_URL, headers=headers, json=payload, timeout=15)
-    if resp.status_code != 200:
-        print(f"[LOI GUI REPLY] {resp.status_code}: {resp.text}")
+# ---------------- Lưu / đọc báo cáo (đọc file mỗi lần -> an toàn nếu có nhiều worker) ----------------
+def load_reports() -> dict:
+    try:
+        with open(STORE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
-def reply_text(reply_token: str, text: str):
-    _reply(reply_token, [{"type": "text", "text": text}])
+def save_reports(data: dict) -> None:
+    tmp = STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, STORE_FILE)
 
 
-def reply_flex(reply_token: str, bubble: dict, alt_text: str):
-    _reply(reply_token, [{"type": "flex", "altText": alt_text, "contents": bubble}])
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data()
-
-    if not verify_signature(body, signature):
-        print("Chu ky khong hop le - tu choi request.")
-        abort(400)
-
-    data = json.loads(body.decode("utf-8"))
-    for event in data.get("events", []):
-        if event.get("type") != "message":
-            continue
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            continue
-
-        text = message.get("text", "").strip().upper()
-        reply_token = event.get("replyToken")
-
-        if text.startswith("DT "):
-            store_code = text[3:].strip()
-            report = latest_reports.get(store_code)
-            if report:
-                reply_flex(reply_token, report["bubble"], report["alt_text"])
-            else:
-                reply_text(
-                    reply_token,
-                    f"Chưa có dữ liệu doanh thu cho mã {store_code}. "
-                    f"Hãy đợi máy tính đẩy dữ liệu lên (chạy push_report.py).",
-                )
-
-    return "OK"
-
-
+# ---------------- 1) Nhận báo cáo từ máy tính ----------------
 @app.route("/update", methods=["POST"])
 def update():
-    """Máy tính gọi endpoint này để đẩy báo cáo mới nhất lên."""
-    secret = request.headers.get("X-Push-Secret", "")
-    if not PUSH_SECRET or secret != PUSH_SECRET:
-        abort(403)
+    secret = env("PUSH_SECRET")
+    if not secret:
+        return jsonify(error="Server chưa cấu hình PUSH_SECRET"), 500
+    if not hmac.compare_digest(request.headers.get("X-Push-Secret", ""), secret):
+        return jsonify(error="Sai X-Push-Secret"), 401
 
-    data = request.get_json(force=True)
-    store_code = str(data.get("store_code", "")).strip()
-    if not store_code:
-        return {"status": "error", "message": "thieu store_code"}, 400
+    body = request.get_json(silent=True) or {}
+    store_code = str(body.get("store_code", "")).strip()
+    bubble = body.get("bubble")
+    alt_text = str(body.get("alt_text", "BÁO CÁO DOANH THU"))[:400]
+    if not store_code or not isinstance(bubble, dict):
+        return jsonify(error="Thiếu store_code hoặc bubble"), 400
 
-    latest_reports[store_code] = {
-        "bubble": data["bubble"],
-        "alt_text": data["alt_text"],
-    }
-    print(f"Da nhan du lieu moi cho ma sieu thi {store_code}")
-    return {"status": "ok", "store_code": store_code}
+    with _lock:
+        data = load_reports()
+        data[store_code] = {"bubble": bubble, "alt_text": alt_text, "updated_at": time.time()}
+        save_reports(data)
+    print(f"[update] Đã lưu báo cáo mã {store_code}: {alt_text}", flush=True)
+    return jsonify(ok=True, store_code=store_code, stores=sorted(data))
 
 
+# ---------------- 2) Webhook LINE ----------------
+def verify_signature(raw_body: bytes) -> bool:
+    channel_secret = env("LINE_CHANNEL_SECRET")
+    if not channel_secret:
+        print("[cảnh báo] Chưa đặt LINE_CHANNEL_SECRET -> bỏ qua xác thực chữ ký", flush=True)
+        return True
+    digest = hmac.new(channel_secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, request.headers.get("X-Line-Signature", ""))
+
+
+def reply(reply_token: str, messages: list) -> None:
+    token = env("LINE_CHANNEL_ACCESS_TOKEN")
+    if not token:
+        print("[lỗi] Thiếu LINE_CHANNEL_ACCESS_TOKEN", flush=True)
+        return
+    resp = requests.post(
+        LINE_REPLY_URL,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        json={"replyToken": reply_token, "messages": messages},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        print(f"[lỗi] Reply LINE {resp.status_code}: {resp.text}", flush=True)
+
+
+def text_msg(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def build_reply(store_code: str | None) -> list:
+    data = load_reports()
+    if not data:
+        return [text_msg("Chưa có dữ liệu. Hãy chạy đẩy báo cáo từ máy tính trước.")]
+
+    if store_code:
+        item = data.get(store_code)
+        if not item:
+            codes = ", ".join(sorted(data))
+            return [text_msg(f"Không có báo cáo cho mã {store_code}. Các mã hiện có: {codes}")]
+        return [{"type": "flex", "altText": item["alt_text"], "contents": item["bubble"]}]
+
+    items = [data[k] for k in sorted(data)][:12]
+    if len(items) == 1:
+        return [{"type": "flex", "altText": items[0]["alt_text"], "contents": items[0]["bubble"]}]
+    return [{
+        "type": "flex",
+        "altText": f"BÁO CÁO DOANH THU ({len(items)} siêu thị)",
+        "contents": {"type": "carousel", "contents": [i["bubble"] for i in items]},
+    }]
+
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    raw = request.get_data()
+    if not verify_signature(raw):
+        abort(400, "Sai chữ ký LINE")
+
+    payload = request.get_json(silent=True) or {}
+    for event in payload.get("events", []):
+        source = event.get("source", {})
+        # In ra log để anh lấy được LINE_GROUP_ID (dạng C....) khi có người nhắn trong group
+        if source.get("groupId"):
+            print(f"[event] groupId = {source['groupId']}", flush=True)
+
+        if event.get("type") != "message" or event.get("message", {}).get("type") != "text":
+            continue
+        m = CMD_RE.match(event["message"].get("text", ""))
+        if not m:
+            continue  # tin nhắn thường -> bot im lặng
+        try:
+            reply(event["replyToken"], build_reply(m.group(1)))
+        except Exception as e:
+            print(f"[lỗi] Xử lý lệnh thất bại: {e}", flush=True)
+    return "OK"  # LINE cần nhận 200 nhanh
+
+
+# ---------------- 3) Health check ----------------
 @app.route("/", methods=["GET"])
-def health_check():
-    return "Bot cloud dang chay OK"
+def health():
+    return jsonify(status="ok", stores=sorted(load_reports()))
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
