@@ -1,250 +1,93 @@
 """
-SERVER CHẠY TRÊN CLOUD (deploy lên Render.com) - PHIÊN BẢN 2
-================================================================
-- Lệnh "DT <mã siêu thị>"  -> trả lời báo cáo DOANH THU TOÀN SIÊU THỊ
-- Lệnh "NAM <mã siêu thị>" -> trả lời báo cáo DOANH THU NGÀNH HÀNG NẤM
-- Không tự đọc file Excel (server ở xa) - chỉ lưu số liệu máy tính đẩy lên qua /update.
+Theo dõi thư mục: khi có file Excel "DoanhThuTheoNgànhHàng*.xlsx" MỚI xuất hiện
+(hoặc được ghi đè bằng bản mới) -> tự gửi báo cáo ngành hàng vào LINE.
 
-BIẾN MÔI TRƯỜNG CẦN SET TRÊN RENDER (giữ nguyên như cũ, không đổi):
-    LINE_CHANNEL_ACCESS_TOKEN
-    LINE_CHANNEL_SECRET
-    PUSH_SECRET
+CÁCH DÙNG (chạy trong thư mục chứa file Excel, cùng thư mục với send_category_report.py):
+    python watch_category.py
+    python watch_category.py --dry-run          # chỉ in, không gửi LINE (để test)
+    python watch_category.py --send-existing    # gửi luôn file đang có sẵn khi khởi động
+
+Cần set LINE_CHANNEL_ACCESS_TOKEN và LINE_GROUP_ID trước khi chạy (file .bat đã set sẵn).
+Dừng bằng Ctrl+C.
 """
 
-import base64
-import hashlib
-import hmac
-import json
+import argparse
+import glob
 import os
+import time
 
-from flask import Flask, request, abort
-import requests
+import send_category_report as rpt
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-PUSH_SECRET = os.environ.get("PUSH_SECRET", "")
-DEFAULT_STORE_CODE = "14978"  # mã siêu thị mặc định khi người dùng chỉ gõ tên lệnh, không kèm mã
-LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
-
-app = Flask(__name__)
-
-latest_reports = {}
+FILE_PATTERN = "DoanhThuTheoNgànhHàng*.xlsx"
+POLL_SECONDS = 10
 
 
-def verify_signature(body: bytes, signature: str) -> bool:
-    if not LINE_CHANNEL_SECRET:
-        return False
-    mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
-    expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
+def file_key(path: str):
+    st = os.stat(path)
+    return (os.path.basename(path), st.st_mtime_ns, st.st_size)
 
 
-def _reply(reply_token: str, messages: list):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-    }
-    payload = {"replyToken": reply_token, "messages": messages}
-    resp = requests.post(LINE_REPLY_URL, headers=headers, json=payload, timeout=15)
-    if resp.status_code != 200:
-        print(f"[LOI GUI REPLY] {resp.status_code}: {resp.text}")
-
-
-def reply_text(reply_token: str, text: str):
-    _reply(reply_token, [{"type": "text", "text": text}])
-
-
-def reply_flex(reply_token: str, bubble: dict, alt_text: str):
-    _reply(reply_token, [{"type": "flex", "altText": alt_text, "contents": bubble}])
-
-
-def _lookup_and_reply(reply_token: str, key: str, not_found_label: str):
-    report = latest_reports.get(key)
-    if report:
-        reply_flex(reply_token, report["bubble"], report["alt_text"])
-    else:
-        reply_text(
-            reply_token,
-            f"Chưa có dữ liệu {not_found_label}. Hãy đợi máy tính đẩy dữ liệu lên.",
-        )
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data()
-
-    if not verify_signature(body, signature):
-        print("Chu ky khong hop le - tu choi request.")
-        abort(400)
-
-    data = json.loads(body.decode("utf-8"))
-    for event in data.get("events", []):
-        if event.get("type") != "message":
-            continue
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            continue
-
-        text = message.get("text", "").strip().upper()
-        reply_token = event.get("replyToken")
-        source = event.get("source", {})
-        print(f"[TIN NHAN] '{text}' tu source: {source}")
-
-        tokens = text.split()
-        if len(tokens) < 1:
-            continue
-        cmd = tokens[0]
-
-        cmd_map = {
-            "DTST": (None, "doanh thu"),
-            "NAMST": ("NAM", "ngành hàng Nấm"),
-            "FRESHST": ("FRESH", "ngành hàng Fresh"),
-            "MMKKST": ("FRESHCT", "chi tiết Nhập/Bán Fresh"),
-            "NXST": ("NX_SUMMARY", "tổng quan Nhập/Xuất"),
-        }
-        if cmd not in cmd_map:
-            continue
-
-        store_code = DEFAULT_STORE_CODE
-
-        # Phat hien yeu cau "thang nay" / "tu ... den hom nay" -> tra ve du lieu MTD da duoc day san
-        is_mtd = (
-            ("THÁNG NÀY" in text)
-            or ("THANG NAY" in text)
-            or (("HÔM NAY" in text or "HOM NAY" in text) and ("ĐẾN" in text or "DEN" in text or "TỪ" in text or "TU" in text))
-        )
-
-        # Loai bo tu de, tim token dang ngay/thang, phan con lai la ten nganh hang (ap dung cho MMKKST/NXST)
-        FILLER_WORDS = ("NGÀY", "NGAY", "TỪ", "TU", "ĐẾN", "DEN", "HÔM", "HOM", "NAY", "THÁNG", "THANG", "NÀY")
-        rest = [t for t in tokens[1:] if t not in FILLER_WORDS]
-        date_token = None
-        remaining = []
-        for t in rest:
-            if date_token is None and "/" in t:
-                date_token = t
-            else:
-                remaining.append(t)
-
-        if is_mtd:
-            date_str = "MTD"
-            date_label = " (tháng này)"
-        else:
-            date_str = normalize_date(date_token) if date_token else None
-            date_label = f" ngày {date_token}" if date_str else ""
-
-        category, label = cmd_map[cmd]
-        key = f"{category}_{store_code}" if category else store_code
-
-        if cmd == "MMKKST" and remaining:
-            cat_text = " ".join(remaining)
-            cat_slug = FRESH_CATEGORY_ALIASES.get(cat_text)
-            if cat_slug:
-                key = f"FRESHCT_{cat_slug}_{store_code}"
-                label = f"chi tiết {cat_text.title()} (Fresh)"
-
-        if cmd == "NXST" and remaining:
-            cat_text = " ".join(remaining)
-            cat_slug = NX_CATEGORY_ALIASES.get(cat_text)
-            if cat_slug:
-                key = f"NX_{cat_slug}_{store_code}"
-                label = f"Nhập/Xuất {cat_text.title()}"
-
-        if date_str:
-            key = f"{key}_{date_str}"
-
-        _lookup_and_reply(reply_token, key, f"{label} cho mã {store_code}{date_label}")
-
-    return "OK"
-
-
-FRESH_CATEGORY_ALIASES = {
-    "RAU CỦ": "RAUCU",
-    "RAU CU": "RAUCU",
-    "RAU": "RAUCU",
-    "TRÁI CÂY": "TRAICAY",
-    "TRAI CAY": "TRAICAY",
-    "THỊT": "THIT",
-    "THIT": "THIT",
-    "THỦY HẢI SẢN": "THUYHAISAN",
-    "THUY HAI SAN": "THUYHAISAN",
-    "HẢI SẢN": "THUYHAISAN",
-    "HAI SAN": "THUYHAISAN",
-}
-
-NX_CATEGORY_ALIASES = {
-    "RAU ĐÀ LẠT": "RAUDALAT",
-    "RAU DA LAT": "RAUDALAT",
-    "RAU ĐỊA PHƯƠNG": "RAUDIAPHUONG",
-    "RAU DIA PHUONG": "RAUDIAPHUONG",
-    "THỊT ĐỊA PHƯƠNG": "THITDIAPHUONG",
-    "THIT DIA PHUONG": "THITDIAPHUONG",
-    "THỊT NHẬP KHẨU": "THITNHAPKHAU",
-    "THIT NHAP KHAU": "THITNHAPKHAU",
-    "TRÁI CÂY NHẬP KHẨU": "TRAICAYNHAPKHAU",
-    "TRAI CAY NHAP KHAU": "TRAICAYNHAPKHAU",
-    "TRÁI CÂY TẬP TRUNG": "TRAICAYTAPTRUNG",
-    "TRAI CAY TAP TRUNG": "TRAICAYTAPTRUNG",
-    "THỦY HẢI SẢN TẬP TRUNG": "THUYSANTAPTRUNG",
-    "THUY HAI SAN TAP TRUNG": "THUYSANTAPTRUNG",
-    "THỦY HẢI SẢN NHẬP KHẨU": "THUYSANNHAPKHAU",
-    "THUY HAI SAN NHAP KHAU": "THUYSANNHAPKHAU",
-    "TRỨNG": "TRUNG",
-    "TRUNG": "TRUNG",
-}
-
-
-def normalize_date(token: str):
-    """Chuyen 'DD/MM' hoac 'DD/MM/YYYY' thanh 'YYYY-MM-DD'. Tra ve None neu khong hop le."""
-    from datetime import datetime as _dt
-
-    parts = token.split("/")
-    if len(parts) == 2:
-        day, month = parts
-        year = _dt.utcnow().year
-    elif len(parts) == 3:
-        day, month, year = parts
-        if len(year) == 2:
-            year = "20" + year
-    else:
-        return None
+def is_stable(path: str, wait: float = 2.0) -> bool:
+    """File đã tải/ghi xong chưa (kích thước không đổi và mở đọc được)."""
     try:
-        d = _dt(int(year), int(month), int(day))
-        return d.strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
-        return None
+        size1 = os.path.getsize(path)
+        time.sleep(wait)
+        if size1 != os.path.getsize(path) or size1 == 0:
+            return False
+        with open(path, "rb"):
+            return True
+    except OSError:
+        return False
 
 
-@app.route("/update", methods=["POST"])
-def update():
-    """Máy tính gọi endpoint này để đẩy báo cáo lên (mới nhất, hoặc kèm ngày cụ thể)."""
-    secret = request.headers.get("X-Push-Secret", "")
-    if not PUSH_SECRET or secret != PUSH_SECRET:
-        abort(403)
-
-    data = request.get_json(force=True)
-    store_code = str(data.get("store_code", "")).strip()
-    category = str(data.get("category", "")).strip().upper()
-    date_str = str(data.get("date", "")).strip()
-    if not store_code:
-        return {"status": "error", "message": "thieu store_code"}, 400
-
-    key = f"{category}_{store_code}" if category else store_code
-    if date_str:
-        key = f"{key}_{date_str}"
-    latest_reports[key] = {
-        "bubble": data["bubble"],
-        "alt_text": data["alt_text"],
-    }
-    print(f"Da nhan du lieu moi cho key {key}")
-    return {"status": "ok", "key": key}
+def process(path: str, top_n: int, dry_run: bool) -> None:
+    day = rpt.load_day(path, None)
+    results = [rpt.build_bubble(g, top_n) for _, g in day.groupby(rpt.COL_STORE)]
+    bubbles = [b for b, _ in results][:12]
+    date_txt = day[rpt.COL_DATE].iloc[0].strftime("%d/%m/%Y")
+    alt = results[0][1] if len(results) == 1 else f"DOANH THU NGÀNH HÀNG {date_txt} ({len(bubbles)} siêu thị)"
+    contents = bubbles[0] if len(bubbles) == 1 else {"type": "carousel", "contents": bubbles}
+    total = day[rpt.COL_REVENUE].sum()
+    print(f"   Ngày {date_txt} | {len(bubbles)} siêu thị | Tổng: {rpt.format_money(total)}")
+    if dry_run:
+        print("   (dry-run: chưa gửi LINE)")
+    else:
+        rpt.send_flex_to_line(contents, alt)
 
 
-@app.route("/", methods=["GET"])
-def health_check():
-    return "Bot cloud dang chay OK"
+def main():
+    ap = argparse.ArgumentParser(description="Tự gửi báo cáo ngành hàng khi có file Excel mới")
+    ap.add_argument("--dry-run", action="store_true", help="Chỉ in, không gửi LINE")
+    ap.add_argument("--send-existing", action="store_true", help="Gửi cả file đã có sẵn lúc khởi động")
+    ap.add_argument("--top", type=int, default=5, help="Số ngành hàng hiển thị (mặc định 5)")
+    args = ap.parse_args()
+
+    seen = set()
+    if not args.send_existing:
+        seen = {file_key(p) for p in glob.glob(FILE_PATTERN)}
+    print(f"Đang theo dõi '{FILE_PATTERN}' trong {os.getcwd()} (kiểm tra mỗi {POLL_SECONDS}s). Ctrl+C để dừng.")
+    if seen:
+        print(f"Bỏ qua {len(seen)} file đã có sẵn (dùng --send-existing nếu muốn gửi luôn).")
+
+    while True:
+        try:
+            for path in sorted(glob.glob(FILE_PATTERN), key=os.path.getmtime):
+                key = file_key(path)
+                if key in seen or not is_stable(path):
+                    continue
+                print(f"[{time.strftime('%H:%M:%S')}] Phát hiện file mới: {path}")
+                try:
+                    process(path, max(1, args.top), args.dry_run)
+                    seen.add(file_key(path))  # chỉ đánh dấu đã xử lý khi thành công
+                except Exception as e:  # lỗi -> thử lại ở vòng sau
+                    print(f"   !!! Lỗi: {e}  (sẽ thử lại sau {POLL_SECONDS}s)")
+        except FileNotFoundError:
+            pass
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nĐã dừng.")
